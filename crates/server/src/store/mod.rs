@@ -15,7 +15,9 @@ pub mod recursor;
 #[cfg(feature = "sqlite")]
 #[cfg_attr(docsrs, doc(cfg(feature = "sqlite")))]
 pub mod sqlite;
+pub mod blocklist;
 
 // TODO: add a dynamic library option?
 
 pub use self::config::StoreConfig;
+pub use self::config::StoreConfigElement;

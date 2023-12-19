@@ -1,0 +1,3 @@
+baddomain.com.
+foo.com
+*.foo.com.

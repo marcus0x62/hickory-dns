@@ -8,7 +8,7 @@
 // TODO, I've implemented this as a separate entity from the cache, but I wonder if the cache
 //  should be the only "front-end" for lookups, where if that misses, then we go to the catalog
 //  then, if requested, do a recursive lookup... i.e. the catalog would only point to files.
-use std::{borrow::Borrow, collections::HashMap, future::Future, io};
+use std::{borrow::Borrow, collections::HashMap, io};
 
 use cfg_if::cfg_if;
 use tracing::{debug, error, info, trace, warn};
@@ -31,7 +31,7 @@ use crate::{
 /// Set of authorities, zones, available to this server.
 #[derive(Default)]
 pub struct Catalog {
-    authorities: HashMap<LowerName, Box<dyn AuthorityObject>>,
+    authorities: HashMap<LowerName, Vec<Box<dyn AuthorityObject>>>,
 }
 
 #[allow(unused_mut, unused_variables)]
@@ -188,12 +188,12 @@ impl Catalog {
     ///
     /// * `name` - zone name, e.g. example.com.
     /// * `authority` - the zone data
-    pub fn upsert(&mut self, name: LowerName, authority: Box<dyn AuthorityObject>) {
-        self.authorities.insert(name, authority);
+    pub fn upsert(&mut self, name: LowerName, authorities: Vec<Box<dyn AuthorityObject>>) {
+        self.authorities.insert(name, authorities);
     }
 
     /// Remove a zone from the catalog
-    pub fn remove(&mut self, name: &LowerName) -> Option<Box<dyn AuthorityObject>> {
+    pub fn remove(&mut self, name: &LowerName) -> Option<Vec<Box<dyn AuthorityObject>>> {
         self.authorities.remove(name)
     }
 
@@ -276,48 +276,46 @@ impl Catalog {
         };
 
         // verify the zone type and number of zones in request, then find the zone to update
-        let request_info = verify_request();
-        let authority = request_info.as_ref().map_err(|e| *e).and_then(|info| {
-            self.find(info.query.name())
-                .map(|a| a.box_clone())
-                .ok_or(ResponseCode::Refused)
-        });
-
-        let response_code = match authority {
-            Ok(authority) => {
-                #[allow(deprecated)]
-                match authority.zone_type() {
-                    ZoneType::Secondary | ZoneType::Slave => {
-                        error!("secondary forwarding for update not yet implemented");
-                        ResponseCode::NotImp
-                    }
-                    ZoneType::Primary | ZoneType::Master => {
-                        let update_result = authority.update(update).await;
-                        match update_result {
-                            // successful update
-                            Ok(..) => ResponseCode::NoError,
-                            Err(response_code) => response_code,
+        match self.find(verify_request().as_ref().expect("Could not get request info").query.name()) {
+            Some(authorities) => {
+                for authority in authorities {
+                    let authority = authority.box_clone();
+                    #[allow(deprecated)]
+                    let response_code = match authority.zone_type() {
+                        ZoneType::Secondary | ZoneType::Slave => {
+                            error!("secondary forwarding for update not yet implemented");
+                            ResponseCode::NotImp
                         }
-                    }
-                    _ => ResponseCode::NotAuth,
+                        ZoneType::Primary | ZoneType::Master => {
+                            let update_result = authority.update(update).await;
+                            match update_result {
+                                // successful update
+                                Ok(..) => ResponseCode::NoError,
+                                Err(response_code) => response_code,
+                            }
+                        }
+                        _ => ResponseCode::NotAuth,
+                    };
+
+                    let response = MessageResponseBuilder::new(Some(update.raw_query()));
+                    let mut response_header = Header::default();
+                    response_header.set_id(update.id());
+                    response_header.set_op_code(OpCode::Update);
+                    response_header.set_message_type(MessageType::Response);
+                    response_header.set_response_code(response_code);
+
+                    return send_response(
+                        response_edns,
+                        response.build_no_records(response_header),
+                        response_handle,
+                    )
+                        .await;
                 }
-            }
-            Err(response_code) => response_code,
+            },
+            None => { }
         };
 
-        let response = MessageResponseBuilder::new(Some(update.raw_query()));
-        let mut response_header = Header::default();
-        response_header.set_id(update.id());
-        response_header.set_op_code(OpCode::Update);
-        response_header.set_message_type(MessageType::Response);
-        response_header.set_response_code(response_code);
-
-        send_response(
-            response_edns,
-            response.build_no_records(response_header),
-            response_handle,
-        )
-        .await
+        Ok(ResponseInfo::serve_failed())
     }
 
     /// Checks whether the `Catalog` contains DNS records for `name`
@@ -346,46 +344,64 @@ impl Catalog {
         response_handle: R,
     ) -> ResponseInfo {
         let request_info = request.request_info();
-        let authority = self.find(request_info.query.name());
+        let authorities = self.find(request_info.query.name());
 
-        if let Some(authority) = authority {
-            lookup(
-                request_info,
-                authority,
-                request,
-                response_edns
-                    .as_ref()
-                    .map(|arc| Borrow::<Edns>::borrow(arc).clone()),
-                response_handle.clone(),
-            )
-            .await
-        } else {
-            // if this is empty then the there are no authorities registered that can handle the request
-            let response = MessageResponseBuilder::new(Some(request.raw_query()));
+        if let Some(authorities) = authorities {
+            for authority in authorities {
+                let result = lookup(
+                    request_info.clone(),
+                    &**authority,
+                    request,
+                    response_edns
+                        .as_ref()
+                        .map(|arc| Borrow::<Edns>::borrow(arc).clone()),
+                    response_handle.clone(),
+                )
+                    .await;
 
-            let result = send_response(
-                response_edns,
-                response.error_msg(request.header(), ResponseCode::Refused),
-                response_handle,
-            )
-            .await;
-
-            match result {
-                Err(e) => {
-                    error!("failed to send response: {}", e);
-                    ResponseInfo::serve_failed()
+                match result {
+                    // The current authority in the chain did not handle the request, so we need to try the next one, if any.
+                    Err(LookupError::NotHandled) => {
+                        debug!("catalog::lookup::authority did not handle request.");
+                    },
+                    Ok(r) => {
+                        debug!("catalog::lookup::authority DID handle request.  Stopping.");
+                        return r;
+                    },
+                    Err(r) => {
+                        debug!("An unexpected error occured during catalog lookup: {r:?}");
+                        return ResponseInfo::serve_failed();
+                    }
                 }
-                Ok(r) => r,
             }
+        }
+
+        // if this is empty then the there are no authorities registered that can handle the request OR all of the authorities declined
+        // to handle the request.
+        let response = MessageResponseBuilder::new(Some(request.raw_query()));
+
+        let result = send_response(
+            response_edns,
+            response.error_msg(request.header(), ResponseCode::Refused),
+            response_handle,
+        )
+        .await;
+
+        match result {
+            Err(e) => {
+                error!("failed to send response: {}", e);
+                ResponseInfo::serve_failed()
+            }
+            Ok(r) => r,
         }
     }
 
     /// Recursively searches the catalog for a matching authority
-    pub fn find(&self, name: &LowerName) -> Option<&(dyn AuthorityObject + 'static)> {
+    pub fn find(&self, name: &LowerName) -> Option<&Vec<Box<dyn AuthorityObject>>> {
         debug!("searching authorities for: {}", name);
         self.authorities
             .get(name)
-            .map(|authority| &**authority)
+            .map(|authority| &*authority)
             .or_else(|| {
                 if !name.is_root() {
                     let name = name.base_name();
@@ -403,7 +419,7 @@ async fn lookup<'a, R: ResponseHandler + Unpin>(
     request: &Request,
     response_edns: Option<Edns>,
     response_handle: R,
-) -> ResponseInfo {
+) -> Result<ResponseInfo,LookupError> {
     let query = request_info.query;
     debug!(
         "request: {} found authority: {}",
@@ -411,7 +427,7 @@ async fn lookup<'a, R: ResponseHandler + Unpin>(
         authority.origin()
     );
 
-    let (response_header, sections) = build_response(
+    let response = build_response(
         authority,
         request_info,
         request.id(),
@@ -421,22 +437,29 @@ async fn lookup<'a, R: ResponseHandler + Unpin>(
     )
     .await;
 
-    let response = MessageResponseBuilder::new(Some(request.raw_query())).build(
-        response_header,
-        sections.answers.iter(),
-        sections.ns.iter(),
-        sections.soa.iter(),
-        sections.additionals.iter(),
-    );
+    if let Err(e) = response {
+        debug!("build response returned error {e:?}");
+        return Err(e);
+    } else {
+        let (response_header,sections) = response.unwrap();
 
-    let result = send_response(response_edns.clone(), response, response_handle.clone()).await;
+        let response = MessageResponseBuilder::new(Some(request.raw_query())).build(
+            response_header,
+            sections.answers.iter(),
+            sections.ns.iter(),
+            sections.soa.iter(),
+            sections.additionals.iter(),
+        );
 
-    match result {
-        Err(e) => {
-            error!("error sending response: {}", e);
-            ResponseInfo::serve_failed()
+        let result = send_response(response_edns.clone(), response, response_handle.clone()).await;
+
+        match result {
+            Err(e) => {
+                error!("error sending response: {}", e);
+                return Err(LookupError::Io(e));
+            }
+            Ok(i) => { return Ok(i); },
         }
-        Ok(i) => i,
     }
 }
 
@@ -471,7 +494,7 @@ async fn build_response(
     request_header: &Header,
     query: &LowerQuery,
     edns: Option<&Edns>,
-) -> (Header, LookupSections) {
+) -> Result<(Header, LookupSections),LookupError> {
     let lookup_options = lookup_options_for_edns(edns);
 
     // log algorithms being requested
@@ -485,8 +508,14 @@ async fn build_response(
     let mut response_header = Header::response_from_request(request_header);
     response_header.set_authoritative(authority.zone_type().is_authoritative());
 
-    debug!("performing {} on {}", query, authority.origin());
-    let future = authority.search(request_info, lookup_options);
+    let future = authority.search(request_info, lookup_options).await;
+
+    // Abort only if the authority declined to handle the request.
+    match future {
+        Ok(ref _r) => { },
+        Err(LookupError::NotHandled) => { return Err(LookupError::NotHandled); },
+        Err(ref _e) => { }
+    }
 
     #[allow(deprecated)]
     let sections = match authority.zone_type() {
@@ -498,19 +527,18 @@ async fn build_response(
                 lookup_options,
                 request_id,
                 query,
-            )
-            .await
+            ).await
         }
         ZoneType::Forward | ZoneType::Hint => {
             send_forwarded_response(future, request_header, &mut response_header).await
         }
     };
 
-    (response_header, sections)
+    return Ok((response_header, sections))
 }
 
 async fn send_authoritative_response(
-    future: impl Future<Output = Result<Box<dyn LookupObject>, LookupError>>,
+    future: Result<Box<dyn LookupObject>, LookupError>,
     authority: &dyn AuthorityObject,
     response_header: &mut Header,
     lookup_options: LookupOptions,
@@ -521,7 +549,7 @@ async fn send_authoritative_response(
     // NS records, which indicate an authoritative response.
     //
     // On Errors, the transition depends on the type of error.
-    let answers = match future.await {
+    let answers = match future {
         Ok(records) => {
             response_header.set_response_code(ResponseCode::NoError);
             response_header.set_authoritative(true);
@@ -614,7 +642,7 @@ async fn send_authoritative_response(
 }
 
 async fn send_forwarded_response(
-    future: impl Future<Output = Result<Box<dyn LookupObject>, LookupError>>,
+    future: Result<Box<dyn LookupObject>, LookupError>,
     request_header: &Header,
     response_header: &mut Header,
 ) -> LookupSections {
@@ -634,7 +662,7 @@ async fn send_forwarded_response(
 
         Box::new(EmptyLookup)
     } else {
-        match future.await {
+        match future {
             Err(e) => {
                 if e.is_nx_domain() {
                     response_header.set_response_code(ResponseCode::NXDomain);

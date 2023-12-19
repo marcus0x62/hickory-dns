@@ -23,6 +23,10 @@ pub enum LookupError {
     /// A record at the same Name as the query exists, but not of the queried RecordType
     #[error("The name exists, but not for the record requested")]
     NameExists,
+    /// The authority did not handle the lookup.  Used in a chained authority/store to indicate the next authority in the chain should be
+    /// consulted.
+    #[error("The consulted authority did not handle the lookup")]
+    NotHandled,
     /// There was an error performing the lookup
     #[error("Error performing lookup: {0}")]
     ResponseCode(ResponseCode),

@@ -17,12 +17,27 @@ use crate::store::recursor::RecursiveConfig;
 #[cfg(feature = "sqlite")]
 use crate::store::sqlite::SqliteConfig;
 
+use crate::store::blocklist::BlockListConfig;
+
 /// Enumeration over all Store configurations
+/// This is the outer container enum, covering the single- and chained-store variants.
+/// The chained store variant is a vector of StoreConfigElements.
+#[derive(Deserialize, PartialEq, Eq, Debug)]
+#[serde(untagged)]
+#[non_exhaustive]
+pub enum StoreConfig {
+    /// For a zone with a single store
+    Single(StoreConfigElement),
+    /// For a zone with multiple stores.  E.g., a recursive or forwarding zone with block lists.
+    Chained(Vec<StoreConfigElement>)
+}
+
+/// Enumeration over all store types.
 #[derive(Deserialize, PartialEq, Eq, Debug)]
 #[serde(tag = "type")]
 #[serde(rename_all = "lowercase")]
 #[non_exhaustive]
-pub enum StoreConfig {
+pub enum StoreConfigElement {
     /// File based configuration
     File(FileConfig),
     /// Sqlite based configuration file
@@ -37,4 +52,6 @@ pub enum StoreConfig {
     #[cfg(feature = "hickory-recursor")]
     #[cfg_attr(docsrs, doc(cfg(feature = "recursor")))]
     Recursor(RecursiveConfig),
+    /// Blocklist Resolver
+    BlockList(BlockListConfig),
 }
