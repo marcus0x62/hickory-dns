@@ -73,7 +73,13 @@ impl RecursiveAuthority {
             });
         }
 
-        let recursor = Recursor::new(roots, config.ns_cache_size, config.record_cache_size)
+        let mut recursor = Recursor::builder();
+        recursor
+            .ns_cache_size(config.ns_cache_size)
+            .record_cache_size(config.record_cache_size)
+            .dnssec_policy(config.dnssec_policy.load()?);
+        let recursor = recursor
+            .build(roots)
             .map_err(|e| format!("failed to initialize recursor: {e}"))?;
 
         Ok(Self {
@@ -97,6 +103,10 @@ impl Authority for RecursiveAuthority {
         false
     }
 
+    fn can_validate_dnssec(&self) -> bool {
+        self.recursor.is_validating()
+    }
+
     async fn update(&self, _update: &MessageRequest) -> UpdateResult<bool> {
         Err(ResponseCode::NotImp)
     }
@@ -115,15 +125,15 @@ impl Authority for RecursiveAuthority {
         &self,
         name: &LowerName,
         rtype: RecordType,
-        _lookup_options: LookupOptions,
-    ) -> Result<Option<Self::Lookup>, LookupError> {
-        debug!("recursive lookup: {} {}", name, rtype);
+        lookup_options: LookupOptions,
+    ) -> Result<Self::Lookup, LookupError> {
+        debug!("recursive lookup: {} {} {:?}", name, rtype, lookup_options);
 
         let query = Query::query(name.into(), rtype);
         let now = Instant::now();
 
         self.recursor
-            .resolve(query, now)
+            .resolve(query, now, lookup_options.dnssec_ok())
             .await
             .map(RecursiveLookup)
             .map(Some)
@@ -168,5 +178,14 @@ impl LookupObject for RecursiveLookup {
 
     fn take_additionals(&mut self) -> Option<Box<dyn LookupObject>> {
         None
+    }
+
+    fn dnssec_validated(&self) -> bool {
+        // TODO research what spec / other impls do when the answer section is empty, DNSSEC
+        // validation is enabled but nameservers provided no NSEC3 records
+        self.0
+            .records()
+            .iter()
+            .all(|record| record.proof().is_secure())
     }
 }
