@@ -308,7 +308,19 @@ impl Recursor {
                     .take_answers()
                     .into_iter()
                     .chain(r.take_name_servers())
-                    .chain(r.take_additionals());
+                    .chain(r.take_additionals())
+                    .filter(|x| {
+                        if !is_subzone(ns.zone().clone(), x.name().clone()) {
+                            warn!(
+                                "Dropping out of bailiwick record {x} for zone {}",
+                                ns.zone().clone()
+                            );
+                            false
+                        } else {
+                            true
+                        }
+                    });
+
                 let lookup = self.record_cache.insert_records(query, records, now);
 
                 lookup.ok_or_else(|| Error::from("no records found"))
