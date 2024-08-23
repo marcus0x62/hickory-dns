@@ -1,7 +1,7 @@
-use std::{net::SocketAddr, sync::Arc, time::Instant};
+use std::{sync::Arc, time::Instant};
 
 use async_recursion::async_recursion;
-use futures_util::{future::select_all, FutureExt};
+use futures_util::{stream::FuturesUnordered, StreamExt};
 use lru_cache::LruCache;
 use parking_lot::Mutex;
 use tracing::{debug, trace, warn};
@@ -11,10 +11,11 @@ use crate::{
         error::ForwardNSData,
         op::Query,
         rr::{RData, RecordType},
+        xfer::DnsResponse,
     },
     recursor_pool::RecursorPool,
     resolver::{
-        config::{NameServerConfig, NameServerConfigGroup, Protocol, ResolverOpts},
+        config::{NameServerConfigGroup, ResolverOpts},
         dns_lru::{DnsLru, TtlConfig},
         error::ResolveError,
         lookup::Lookup,
@@ -23,6 +24,44 @@ use crate::{
     },
     Error, ErrorKind,
 };
+
+/// This macro is used in ns_pool_for_zone and ns_pool_for_referral to resolve futures related to
+/// nameserver lookups.  There are a few variations of lookup methods in use, with differing future
+/// types and return types, but the resolution loop is otherwise identical, so this macro will help
+/// bridge the type differences.  This macro expects a closure to be passed (the "processor"
+/// argument,) which takes a positive future response and adds the responses to the
+/// NameServerConfigGroup in config_group.  The closure must take two arguments: an
+/// &mut NameServerConfigGroup and a response type, which should be a reference to the response type
+/// returned by the lookup future.  For instance, for resolution futures that use recursor.resolve,
+/// the response type argument should be &Lookup.  For resolution futures that use
+/// NameServerPool.lookup, the response argument should be &DnsResponse.  A typical closure looks
+/// something like this:
+///
+/// ```rust,ignore
+///     let processor = |cg: &mut NameServerConfigGroup, response: &Lookup| {
+///         cg.append_ips(response.iter().filter_map(RData::ip_addr), true);
+///     };
+/// ```
+macro_rules! process_futures {
+    ( $futures:expr, $config_group:expr, $processor:expr, $callsite:expr) => {
+        loop {
+            match $futures.next().await {
+                Some(next) => match next {
+                    Ok(response) => {
+                        debug!("{} A or AAAA response: {:?}", $callsite, response);
+                        $processor($config_group, &response);
+                    }
+                    Err(e) => {
+                        warn!("{} resolution failed failed: {}", $callsite, e);
+                    }
+                },
+                None => {
+                    break;
+                }
+            }
+        }
+    };
+}
 
 /// Set of nameservers by the zone name
 type NameServerCache<P> = LruCache<Name, RecursorPool<P>>;
@@ -270,6 +309,7 @@ impl RecursorDnsHandle {
         // TODO: check for cached ns pool for this zone
 
         let lookup = Query::query(zone.clone(), RecordType::NS);
+
         let response = self
             .lookup(lookup.clone(), nameserver_pool.clone(), request_time, false)
             .await?;
@@ -285,15 +325,9 @@ impl RecursorDnsHandle {
         // unpack all glued records
         for zns in response.record_iter() {
             if let Some(ns_data) = zns.data().as_ns() {
-                // let glue_ips = glue
-                //     .iter()
-                //     .filter(|g| g.name() == ns_data)
-                //     .filter_map(Record::data)
-                //     .filter_map(RData::to_ip_addr);
-
                 if !super::is_subzone(&zone.base_name(), zns.name()) {
                     warn!(
-                        "Dropping out of bailiwick record for {:?} with parent {:?}",
+                        "dropping out of bailiwick record for {:?} with parent {:?}",
                         zns.name().clone(),
                         zone.base_name().clone()
                     );
@@ -312,71 +346,95 @@ impl RecursorDnsHandle {
                 let cached_a = cached_a.and_then(Result::ok).map(Lookup::into_iter);
                 let cached_aaaa = cached_aaaa.and_then(Result::ok).map(Lookup::into_iter);
 
-                let glue_ips = cached_a
+                let mut glue_ips = cached_a
                     .into_iter()
                     .flatten()
                     .chain(cached_aaaa.into_iter().flatten())
-                    .filter_map(|r| RData::ip_addr(&r));
+                    .filter_map(|r| r.ip_addr())
+                    .peekable();
 
-                let mut had_glue = false;
-                for ip in glue_ips {
-                    let mut udp = NameServerConfig::new(SocketAddr::from((ip, 53)), Protocol::Udp);
-                    let mut tcp = NameServerConfig::new(SocketAddr::from((ip, 53)), Protocol::Tcp);
-
-                    udp.trust_negative_responses = true;
-                    tcp.trust_negative_responses = true;
-
-                    config_group.push(udp);
-                    config_group.push(tcp);
-                    had_glue = true;
-                }
-
-                if !had_glue {
+                if glue_ips.peek().is_none() {
                     debug!("glue not found for {}", ns_data);
                     need_ips_for_names.push(ns_data);
                 }
+
+                config_group.append_ips(glue_ips, true);
             }
         }
 
-        // collect missing IP addresses, select over them all, get the addresses
-        // make it configurable to query for all records?
+        // If we have no glue, collect missing IP addresses for non-child NS servers
+        // Querying for child NS servers can result in infinite recursion if the
+        // parent nameserver never returns glue records for child NS records, or does
+        // so based on cache freshness (observed with BIND)
         if config_group.is_empty() && !need_ips_for_names.is_empty() {
-            debug!("need glue for {}", zone);
-            let a_resolves = need_ips_for_names.iter().take(1).map(|name| {
-                let a_query = Query::query(name.0.clone(), RecordType::A);
-                self.resolve(a_query, request_time, false).boxed()
-            });
+            debug!("need glue for {zone}");
 
-            let aaaa_resolves = need_ips_for_names.iter().take(1).map(|name| {
-                let aaaa_query = Query::query(name.0.clone(), RecordType::AAAA);
-                self.resolve(aaaa_query, request_time, false).boxed()
-            });
-
-            let mut a_resolves: Vec<_> = a_resolves.chain(aaaa_resolves).collect();
-            while !a_resolves.is_empty() {
-                let (next, _, rest) = select_all(a_resolves).await;
-                a_resolves = rest;
-
-                match next {
-                    Ok(response) => {
-                        debug!("A or AAAA response: {:?}", response);
-                        let ips = response.iter().filter_map(RData::ip_addr);
-
-                        for ip in ips {
-                            let udp =
-                                NameServerConfig::new(SocketAddr::from((ip, 53)), Protocol::Udp);
-                            let tcp =
-                                NameServerConfig::new(SocketAddr::from((ip, 53)), Protocol::Tcp);
-
-                            config_group.push(udp);
-                            config_group.push(tcp);
-                        }
+            let mut resolve_futures = FuturesUnordered::new();
+            need_ips_for_names
+                .iter()
+                .filter(|name| !crate::is_subzone(&zone, &name.0))
+                .take(1)
+                .for_each(|name| {
+                    for rec_type in [RecordType::A, RecordType::AAAA] {
+                        resolve_futures.push(self.resolve(
+                            Query::query(name.0.clone(), rec_type),
+                            request_time,
+                            self.security_aware,
+                        ));
                     }
-                    Err(e) => {
-                        warn!("resolve failed {}", e);
+                });
+
+            let processor = |cg: &mut NameServerConfigGroup, response: &Lookup| {
+                cg.append_ips(response.iter().filter_map(RData::ip_addr), true);
+            };
+            process_futures!(
+                resolve_futures,
+                &mut config_group,
+                processor,
+                "ns_pool_for_zone:resolve"
+            );
+        }
+
+        // If we still have no NS records, try to query the parent zone for child NS servers
+        // Note that while this section looks very similar to the previous section, there is
+        // a very important difference: the use of lookup to resolve NS addresses, vs resolve
+        // in the previous section.  Using resolve here will cause an infinite loop for these
+        // nameservers. Using lookup with nameserver_pool in the previous section would almost
+        // always cause resolution failures.
+        if config_group.is_empty() && !need_ips_for_names.is_empty() {
+            debug!("priming zone {zone} via parent zone {}", zone.base_name());
+
+            let mut lookup_futures = FuturesUnordered::new();
+            need_ips_for_names
+                .iter()
+                .filter(|name| crate::is_subzone(&zone, &name.0))
+                .take(1)
+                .for_each(|name| {
+                    for rec_type in [RecordType::A, RecordType::AAAA] {
+                        lookup_futures.push(
+                            nameserver_pool.lookup(
+                                Query::query(name.0.clone(), rec_type),
+                                self.security_aware,
+                            ),
+                        );
                     }
-                }
-            }
+                });
+
+            let processor = |cg: &mut NameServerConfigGroup, response: &DnsResponse| {
+                cg.append_ips(
+                    response
+                        .answers()
+                        .iter()
+                        .filter_map(|answer| answer.data().ip_addr()),
+                    true,
+                );
+            };
+            process_futures!(
+                lookup_futures,
+                &mut config_group,
+                processor,
+                "ns_pool_for_zone:lookup"
+            );
         }
 
         // now construct a namesever pool based off the NS and glue records
@@ -451,34 +509,17 @@ impl RecursorDnsHandle {
             let cached_a = cached_a.and_then(Result::ok).map(Lookup::into_iter);
             let cached_aaaa = cached_aaaa.and_then(Result::ok).map(Lookup::into_iter);
 
-            let mut glue_ips: Vec<_> = cached_a
+            let mut glue_ips = cached_a
                 .into_iter()
                 .flatten()
                 .chain(cached_aaaa.into_iter().flatten())
                 .filter_map(|r| RData::ip_addr(&r))
                 .chain(glue.filter_map(|r| RData::ip_addr(r.data())))
-                .collect();
+                .peekable();
 
-            // It is possible to get duplicate IPs when an NS is in the cache or if
-            // multiple nameservers in the referral list were configured with the same IP
-            // for some reason, but in any case, strip any duplicates out.
-            glue_ips.sort();
-            glue_ips.dedup();
-
-            let mut had_glue = false;
-            for ip in glue_ips {
-                let mut udp = NameServerConfig::new(SocketAddr::from((ip, 53)), Protocol::Udp);
-                let mut tcp = NameServerConfig::new(SocketAddr::from((ip, 53)), Protocol::Tcp);
-
-                udp.trust_negative_responses = true;
-                tcp.trust_negative_responses = true;
-
-                config_group.push(udp);
-                config_group.push(tcp);
-                had_glue = true;
-            }
-
-            if !had_glue {
+            if glue_ips.peek().is_some() {
+                config_group.append_ips(glue_ips, true);
+            } else {
                 debug!("ns_pool_for_referral glue not found for {}", ns);
                 need_ips_for_names.push(ns);
             }
@@ -490,42 +531,27 @@ impl RecursorDnsHandle {
         // make it configurable to query for all records?
         if config_group.is_empty() && !need_ips_for_names.is_empty() {
             debug!("ns_pool_for_referral need glue for {}", query_name);
-            let a_resolves = need_ips_for_names.iter().take(1).map(|name| {
-                let a_query = Query::query(name.data().as_ns().unwrap().0.clone(), RecordType::A);
-                self.resolve(a_query, request_time, false).boxed()
-            });
 
-            let aaaa_resolves = need_ips_for_names.iter().take(1).map(|name| {
-                let aaaa_query =
-                    Query::query(name.data().as_ns().unwrap().0.clone(), RecordType::AAAA);
-                self.resolve(aaaa_query, request_time, false).boxed()
-            });
-
-            let mut a_resolves: Vec<_> = a_resolves.chain(aaaa_resolves).collect();
-            while !a_resolves.is_empty() {
-                let (next, _, rest) = select_all(a_resolves).await;
-                a_resolves = rest;
-
-                match next {
-                    Ok(response) => {
-                        debug!("ns_pool_for_referral A or AAAA response: {:?}", response);
-                        let ips = response.iter().filter_map(RData::ip_addr);
-
-                        for ip in ips {
-                            let udp =
-                                NameServerConfig::new(SocketAddr::from((ip, 53)), Protocol::Udp);
-                            let tcp =
-                                NameServerConfig::new(SocketAddr::from((ip, 53)), Protocol::Tcp);
-
-                            config_group.push(udp);
-                            config_group.push(tcp);
-                        }
-                    }
-                    Err(e) => {
-                        warn!("ns_pool_for_referral resolve failed {}", e);
-                    }
-                }
+            let mut resolve_futures = FuturesUnordered::new();
+            for rec_type in [RecordType::A, RecordType::AAAA] {
+                need_ips_for_names.iter().take(1).for_each(|name| {
+                    resolve_futures.push(self.resolve(
+                        Query::query(name.data().as_ns().unwrap().0.clone(), rec_type),
+                        request_time,
+                        false,
+                    ));
+                });
             }
+
+            let processor = |cg: &mut NameServerConfigGroup, response: &Lookup| {
+                cg.append_ips(response.iter().filter_map(RData::ip_addr), true);
+            };
+            process_futures!(
+                resolve_futures,
+                &mut config_group,
+                processor,
+                "ns_pool_for_referral:resolve"
+            );
         }
 
         debug!(
