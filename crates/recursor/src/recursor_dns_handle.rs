@@ -1,7 +1,7 @@
-use std::{sync::Arc, time::Instant};
+use std::{fmt, net::IpAddr, sync::Arc, time::Instant};
 
 use async_recursion::async_recursion;
-use futures_util::{stream::FuturesUnordered, StreamExt};
+use futures_util::{stream::FuturesUnordered, Stream, StreamExt};
 use lru_cache::LruCache;
 use parking_lot::Mutex;
 use tracing::{debug, trace, warn};
@@ -11,7 +11,6 @@ use crate::{
         error::ForwardNSData,
         op::Query,
         rr::{RData, RecordType},
-        xfer::DnsResponse,
     },
     recursor_pool::RecursorPool,
     resolver::{
@@ -24,44 +23,6 @@ use crate::{
     },
     Error, ErrorKind,
 };
-
-/// This macro is used in ns_pool_for_zone and ns_pool_for_referral to resolve futures related to
-/// nameserver lookups.  There are a few variations of lookup methods in use, with differing future
-/// types and return types, but the resolution loop is otherwise identical, so this macro will help
-/// bridge the type differences.  This macro expects a closure to be passed (the "processor"
-/// argument,) which takes a positive future response and adds the responses to the
-/// NameServerConfigGroup in config_group.  The closure must take two arguments: an
-/// &mut NameServerConfigGroup and a response type, which should be a reference to the response type
-/// returned by the lookup future.  For instance, for resolution futures that use recursor.resolve,
-/// the response type argument should be &Lookup.  For resolution futures that use
-/// NameServerPool.lookup, the response argument should be &DnsResponse.  A typical closure looks
-/// something like this:
-///
-/// ```rust,ignore
-///     let processor = |cg: &mut NameServerConfigGroup, response: &Lookup| {
-///         cg.append_ips(response.iter().filter_map(RData::ip_addr), true);
-///     };
-/// ```
-macro_rules! process_futures {
-    ( $futures:expr, $config_group:expr, $processor:expr, $callsite:expr) => {
-        loop {
-            match $futures.next().await {
-                Some(next) => match next {
-                    Ok(response) => {
-                        debug!("{} A or AAAA response: {:?}", $callsite, response);
-                        $processor($config_group, &response);
-                    }
-                    Err(e) => {
-                        warn!("{} resolution failed failed: {}", $callsite, e);
-                    }
-                },
-                None => {
-                    break;
-                }
-            }
-        }
-    };
-}
 
 /// Set of nameservers by the zone name
 type NameServerCache<P> = LruCache<Name, RecursorPool<P>>;
@@ -384,15 +345,13 @@ impl RecursorDnsHandle {
                     }
                 });
 
-            let processor = |cg: &mut NameServerConfigGroup, response: &Lookup| {
-                cg.append_ips(response.iter().filter_map(RData::ip_addr), true);
-            };
-            process_futures!(
-                resolve_futures,
+            append_ips_from_lookup(
+                |rsp| rsp.into_iter().filter_map(|r| r.ip_addr()),
+                &mut resolve_futures,
                 &mut config_group,
-                processor,
-                "ns_pool_for_zone:resolve"
-            );
+                "ns_pool_for_zone:resolve",
+            )
+            .await;
         }
 
         // If we still have no NS records, try to query the parent zone for child NS servers
@@ -420,21 +379,17 @@ impl RecursorDnsHandle {
                     }
                 });
 
-            let processor = |cg: &mut NameServerConfigGroup, response: &DnsResponse| {
-                cg.append_ips(
-                    response
-                        .answers()
-                        .iter()
-                        .filter_map(|answer| answer.data().ip_addr()),
-                    true,
-                );
-            };
-            process_futures!(
-                lookup_futures,
+            append_ips_from_lookup(
+                |mut rsp| {
+                    rsp.take_answers()
+                        .into_iter()
+                        .filter_map(|answer| answer.data().ip_addr())
+                },
+                &mut lookup_futures,
                 &mut config_group,
-                processor,
-                "ns_pool_for_zone:lookup"
-            );
+                "ns_pool_for_zone:lookup",
+            )
+            .await;
         }
 
         // now construct a namesever pool based off the NS and glue records
@@ -543,15 +498,13 @@ impl RecursorDnsHandle {
                 });
             }
 
-            let processor = |cg: &mut NameServerConfigGroup, response: &Lookup| {
-                cg.append_ips(response.iter().filter_map(RData::ip_addr), true);
-            };
-            process_futures!(
-                resolve_futures,
+            append_ips_from_lookup(
+                |rsp| rsp.into_iter().filter_map(|r| r.ip_addr()),
+                &mut resolve_futures,
                 &mut config_group,
-                processor,
-                "ns_pool_for_referral:resolve"
-            );
+                "ns_pool_for_referral:resolve",
+            )
+            .await;
         }
 
         debug!(
@@ -576,6 +529,25 @@ impl RecursorDnsHandle {
     #[cfg(feature = "dnssec")]
     pub(crate) fn record_cache(&self) -> &DnsLru {
         &self.record_cache
+    }
+}
+
+async fn append_ips_from_lookup<E: fmt::Display, R: fmt::Debug, I: Iterator<Item = IpAddr>>(
+    extract_ips: impl Fn(R) -> I,
+    futures: &mut (impl Stream<Item = Result<R, E>> + Unpin),
+    config: &mut NameServerConfigGroup,
+    activity: &str,
+) {
+    while let Some(next) = futures.next().await {
+        match next {
+            Ok(response) => {
+                debug!("{activity} A or AAAA response: {response:?}");
+                config.append_ips(extract_ips(response), true);
+            }
+            Err(e) => {
+                warn!("{activity} resolution failed failed: {e}");
+            }
+        }
     }
 }
 
