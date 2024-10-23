@@ -97,6 +97,13 @@ impl RecursiveAuthority {
                     Some(config.recursion_limit)
                 }
             )
+            .ns_recursion_limit(
+                if config.ns_recursion_limit == 0 {
+                    None
+                } else {
+                    Some(config.ns_recursion_limit)
+                }
+            )
             .avoid_local_udp_ports(config.avoid_local_udp_ports.clone())
             .build(roots)
             .map_err(|e| format!("failed to initialize recursor: {e}"))?;
