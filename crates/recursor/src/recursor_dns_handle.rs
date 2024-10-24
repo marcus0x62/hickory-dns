@@ -647,25 +647,41 @@ impl RecursorDnsHandle {
         if config_group.is_empty() && !need_ips_for_names.is_empty() {
             debug!("ns_pool_for_referral need glue for {query_name}");
 
-            let mut resolve_futures = FuturesUnordered::new();
-            for rec_type in [RecordType::A, RecordType::AAAA] {
-                need_ips_for_names.iter().take(1).for_each(|name| {
-                    resolve_futures.push(self.resolve(
-                        Query::query(name.data().as_ns().unwrap().0.clone(), rec_type),
-                        request_time,
-                        self.security_aware,
-                        depth,
-                    ));
-                });
-            }
+            for name in need_ips_for_names.iter() {
+                let Some(ns) = name.data().as_ns() else {
+                    warn!("record is not NS: {:?}; skipping", name.data());
+                    continue;
+                };
 
-            self.append_ips_from_lookup(
-                |rsp| rsp.into_iter().filter_map(|r| r.ip_addr()),
-                &mut resolve_futures,
-                &mut config_group,
-                "ns_pool_for_referral:resolve",
-            )
-            .await;
+                let record_name = ns.0.clone();
+
+                let (new_depth, nameserver_pool) = self
+                    .ns_pool_for_zone(record_name.clone(), request_time, depth)
+                    .await?;
+
+                depth = new_depth;
+
+                let mut lookup_futures = FuturesUnordered::new();
+
+                for rec_type in [RecordType::A, RecordType::AAAA] {
+                    lookup_futures.push(nameserver_pool.lookup(
+                        Query::query(record_name.clone(), rec_type),
+                        self.security_aware,
+                    ));
+                }
+
+                self.append_ips_from_lookup(
+                    |mut rsp| {
+                        rsp.take_answers()
+                            .into_iter()
+                            .filter_map(|answer| answer.data().ip_addr())
+                    },
+                    &mut lookup_futures,
+                    &mut config_group,
+                    "ns_pool_for_referral:resolve",
+                )
+                .await;
+            }
         }
 
         debug!("ns_pool_for_referral found nameservers for {query_name}: {config_group:?}");
