@@ -19,7 +19,7 @@ use tracing::{debug, error, trace, warn};
 #[cfg(feature = "__dnssec")]
 use crate::proto::dnssec::{DnssecDnsHandle, TrustAnchors};
 use crate::{
-    AccessControlSet, DnssecPolicy, Error, ErrorKind, RecursorBuilder,
+    DnssecPolicy, Error, ErrorKind, RecursorBuilder,
     error::AuthorityData,
     is_subzone,
     proto::{
@@ -30,6 +30,7 @@ use crate::{
             Record, RecordType,
             rdata::{A, AAAA, NS},
         },
+        util::accesscontrol::AccessControlSet,
     },
     recursor::RecursorMode,
     recursor_pool::RecursorPool,

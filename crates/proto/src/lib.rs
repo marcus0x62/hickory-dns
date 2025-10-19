@@ -76,6 +76,8 @@ pub mod serialize;
 pub mod tcp;
 #[cfg(feature = "std")]
 pub mod udp;
+#[cfg(feature = "util")]
+pub mod util;
 pub mod xfer;
 
 #[doc(hidden)]
