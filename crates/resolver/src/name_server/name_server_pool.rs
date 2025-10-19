@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use futures_util::stream::{FuturesUnordered, Stream, StreamExt, once};
 use smallvec::SmallVec;
-use tracing::debug;
+use tracing::{debug, error};
 
 use crate::config::{
     NameServerConfig, OpportunisticEncryption, ResolverOpts, ServerOrderingStrategy,
@@ -25,15 +25,23 @@ use crate::config::{
 };
 use crate::name_server::connection_provider::{ConnectionProvider, TlsConfig};
 use crate::name_server::name_server::{ConnectionPolicy, NameServer};
-use crate::proto::op::{DnsRequest, DnsResponse, ResponseCode};
-use crate::proto::runtime::{RuntimeProvider, Time};
-use crate::proto::xfer::DnsHandle;
-use crate::proto::{DnsError, NoRecords, ProtoError, ProtoErrorKind};
+use crate::proto::{
+    DnsError, NoRecords, ProtoError, ProtoErrorKind,
+    op::{DnsRequest, DnsResponse, ResponseCode},
+    rr::{
+        RData, Record,
+        rdata::{A, AAAA},
+    },
+    runtime::{RuntimeProvider, Time},
+    util::accesscontrol::AccessControlSet,
+    xfer::DnsHandle,
+};
 
 /// Abstract interface for mocking purpose
 #[derive(Clone)]
 pub struct NameServerPool<P: ConnectionProvider> {
     state: Arc<PoolState<P>>,
+    answer_address_filter: Option<Arc<AccessControlSet>>,
 }
 
 impl<P: ConnectionProvider> NameServerPool<P> {
@@ -71,12 +79,23 @@ impl<P: ConnectionProvider> NameServerPool<P> {
                 cx,
                 next: AtomicUsize::new(0),
             }),
+            answer_address_filter: None,
         }
     }
 
     /// Returns the pool's options.
     pub fn context(&self) -> &Arc<PoolContext> {
         &self.state.cx
+    }
+
+    /// Add an answer address filter
+    pub fn set_answer_filter(&mut self, answer_filter: Arc<AccessControlSet>) {
+        self.answer_address_filter = Some(answer_filter);
+    }
+
+    /// Remove answer address filter
+    pub fn clear_answer_filter(&mut self) {
+        self.answer_address_filter = None;
     }
 }
 
@@ -86,9 +105,60 @@ impl<P: ConnectionProvider> DnsHandle for NameServerPool<P> {
 
     fn send(&self, request: DnsRequest) -> Self::Response {
         let state = self.state.clone();
+        let acs = self.answer_address_filter.clone();
         Box::pin(once(async move {
             debug!("sending request: {:?}", request.queries());
-            state.try_send(request).await
+            let mut response = state.try_send(request).await?;
+
+            let bind = response.owned_queries();
+            let Some(query) = bind.first() else {
+                return Err("no query in response".into());
+            };
+
+            let Some(acs) = acs else {
+                return Ok(response);
+            };
+
+            let answer_filter = |record: &Record| {
+                let ip = match record.data() {
+                    RData::A(A(ipv4)) => (*ipv4).into(),
+                    RData::AAAA(AAAA(ipv6)) => (*ipv6).into(),
+                    _ => return true,
+                };
+
+                if acs.denied(ip) {
+                    error!(
+                        %query,
+                        %ip,
+                        "removing ip from response: answer filter matched"
+                    );
+
+                    false
+                } else {
+                    true
+                }
+            };
+
+            let answers_len = response.answers().len();
+            let authorities_len = response.authorities().len();
+
+            response.additionals_mut().retain(answer_filter);
+            response.answers_mut().retain(answer_filter);
+            response.authorities_mut().retain(answer_filter);
+
+            if response.answers().is_empty() && answers_len != 0
+                || (response.answers().is_empty()
+                    && response.authorities().is_empty()
+                    && authorities_len != 0)
+            {
+                return Err(crate::proto::NoRecords::new(
+                    Box::new(query.clone()),
+                    ResponseCode::NXDomain,
+                )
+                .into());
+            }
+
+            Ok(response)
         }))
     }
 }

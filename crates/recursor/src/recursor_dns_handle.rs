@@ -53,7 +53,7 @@ pub(crate) struct RecursorDnsHandle<P: ConnectionProvider> {
     recursion_limit: Option<u8>,
     ns_recursion_limit: Option<u8>,
     security_aware: bool,
-    answer_address_filter: AccessControlSet,
+    answer_address_filter: Arc<AccessControlSet>,
     name_server_filter: AccessControlSet,
     pool_context: Arc<PoolContext>,
     encrypted_transport_state: SharedNameServerTransportState,
@@ -108,13 +108,16 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
             tls,
             opportunistic_encryption,
         ));
-        let roots = NameServerPool::from_config(
+        let mut roots = NameServerPool::from_config(
             servers,
             pool_context.clone(),
             &encrypted_transport_state,
             opportunistic_probe_budget.clone(),
             conn_provider.clone(),
         );
+
+        let answer_address_filter = Arc::new(answer_address_filter);
+        roots.set_answer_filter(answer_address_filter.clone());
 
         let roots = RecursorPool::from(Name::root(), roots);
         let name_server_cache = Arc::new(Mutex::new(LruCache::new(ns_cache_size)));
@@ -418,23 +421,7 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
                 return false;
             }
 
-            let ip = match record.data() {
-                RData::A(A(ipv4)) => (*ipv4).into(),
-                RData::AAAA(AAAA(ipv6)) => (*ipv6).into(),
-                _ => return true,
-            };
-
-            if self.answer_address_filter.denied(ip) {
-                error!(
-                    %query,
-                    %ip,
-                    "removing ip from response: answer filter matched"
-                );
-
-                false
-            } else {
-                true
-            }
+            true
         };
 
         let answers_len = response.answers().len();
@@ -597,13 +584,14 @@ impl<P: ConnectionProvider> RecursorDnsHandle<P> {
         }
 
         // now construct a namesever pool based off the NS and glue records
-        let ns = NameServerPool::from_config(
+        let mut ns = NameServerPool::from_config(
             config_group,
             self.pool_context.clone(),
             &self.encrypted_transport_state,
             self.opportunistic_probe_budget.clone(),
             self.conn_provider.clone(),
         );
+        ns.set_answer_filter(self.answer_address_filter.clone());
         let ns = RecursorPool::from(zone.clone(), ns);
 
         // store in cache for future usage

@@ -453,6 +453,11 @@ impl Message {
         &mut self.queries
     }
 
+    /// Return an owned copy of the queries while leaving them in the Message.
+    pub fn owned_queries(&self) -> Vec<Query> {
+        self.queries.clone()
+    }
+
     /// Removes all the answers from the Message
     pub fn take_queries(&mut self) -> Vec<Query> {
         mem::take(&mut self.queries)
